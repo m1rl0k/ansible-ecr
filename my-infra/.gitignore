@@ -1,7 +1,1 @@
-.env
-.env*
-**/secrets/*
-**/
-.aws/*
-**/*.pem
-**/*.key 
+
