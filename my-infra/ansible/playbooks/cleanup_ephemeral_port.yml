@@ -1,0 +1,147 @@
+---
+- name: Cleanup ephemeral environment resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/all.yml"
+  environment:
+    AWS_ACCESS_KEY_ID: "{{ aws_access_key_id }}"
+    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key }}"
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+    AWS_REGION: "{{ aws_region }}"
+
+  tasks:
+    ##################################################################
+    # 1) Identify and Clean Target Groups
+    ##################################################################
+    - name: Fetch all Target Groups
+      shell: >
+        aws elbv2 describe-target-groups 
+        --region "{{ aws_region }}"
+        --output json
+      register: target_groups_raw
+      changed_when: false
+
+    - name: Filter Ephemeral Target Groups
+      set_fact:
+        target_groups_to_delete: >-
+          {{ 
+            (target_groups_raw.stdout | from_json).TargetGroups | default([]) | 
+            selectattr('TargetGroupName', 'match', '^tg-port[0-9]+-[0-9]{14}$') |
+            selectattr('LoadBalancerArns', 'contains', alb_arn) |
+            map(attribute='TargetGroupArn') | list
+          }}
+
+    ##################################################################
+    # 2) Identify and Clean ECS Services
+    ##################################################################
+    - name: Get Services from ECS Cluster
+      shell: >
+        aws ecs list-services
+        --cluster "{{ ecs_cluster_name }}"
+        --region "{{ aws_region }}"
+        --output json
+      register: ecs_services
+
+    - name: Filter Ephemeral Services
+      set_fact:
+        services_to_delete: >-
+          {{ 
+            (ecs_services.stdout | from_json).serviceArns | default([]) | 
+            select('match', '.*ephemeral-[0-9]{14}$') | list
+          }}
+
+    ##################################################################
+    # 3) Identify and Clean ALB Listeners
+    ##################################################################
+    - name: Get listeners for ALB
+      shell: >
+        aws elbv2 describe-listeners
+        --load-balancer-arn "{{ alb_arn }}"
+        --region "{{ aws_region }}"
+        --output json
+      register: listeners_raw
+
+    - name: Find listeners to delete
+      set_fact:
+        listeners_to_delete: >-
+          {{ 
+            listeners_raw.stdout | from_json | json_query('Listeners[?contains(DefaultActions[0].TargetGroupArn, `tg-port`)]') |
+            map(attribute='ListenerArn') | list
+          }}
+
+    ##################################################################
+    # 4) Identify and Clean CloudWatch Log Groups
+    ##################################################################
+    - name: Get CloudWatch Log Groups
+      shell: >
+        aws logs describe-log-groups
+        --log-group-name-prefix "/ecs/ephemeral/"
+        --region "{{ aws_region }}"
+        --output json
+      register: log_groups_raw
+
+    - name: Filter Ephemeral Log Groups
+      set_fact:
+        log_groups_to_delete: >-
+          {{ 
+            (log_groups_raw.stdout | from_json).logGroups | default([]) |
+            map(attribute='logGroupName') | list
+          }}
+
+    ##################################################################
+    # 5) Cleanup Actions
+    ##################################################################
+    - name: Delete ECS Services
+      shell: >
+        aws ecs delete-service
+        --cluster "{{ ecs_cluster_name }}"
+        --service "{{ item | basename }}"
+        --force
+        --region "{{ aws_region }}"
+      loop: "{{ services_to_delete }}"
+      ignore_errors: true
+      when: services_to_delete | length > 0
+
+    - name: Delete Listeners
+      shell: >
+        aws elbv2 delete-listener
+        --listener-arn "{{ item }}"
+        --region "{{ aws_region }}"
+      loop: "{{ listeners_to_delete }}"
+      ignore_errors: true
+      when: listeners_to_delete | length > 0
+
+    - name: Delete Target Groups
+      shell: >
+        aws elbv2 delete-target-group
+        --target-group-arn "{{ item }}"
+        --region "{{ aws_region }}"
+      loop: "{{ target_groups_to_delete }}"
+      ignore_errors: true
+      when: target_groups_to_delete | length > 0
+
+    - name: Delete CloudWatch Log Groups
+      shell: >
+        aws logs delete-log-group
+        --log-group-name "{{ item }}"
+        --region "{{ aws_region }}"
+      loop: "{{ log_groups_to_delete }}"
+      ignore_errors: true
+      when: log_groups_to_delete | length > 0
+
+    ##################################################################
+    # 6) Summary
+    ##################################################################
+    - name: Display Cleanup Summary
+      debug:
+        msg:
+          - "Cleanup Summary:"
+          - "Environment: {{ environment_tag }}"
+          - "Cluster: {{ ecs_cluster_name }}"
+          - "Load Balancer: {{ alb_name }}"
+          - "ECS Services found for deletion: {{ services_to_delete | length }}"
+          - "Target Groups found for deletion: {{ target_groups_to_delete | length }}"
+          - "Listeners found for deletion: {{ listeners_to_delete | length }}"
+          - "CloudWatch Log Groups found for deletion: {{ log_groups_to_delete | length }}"
