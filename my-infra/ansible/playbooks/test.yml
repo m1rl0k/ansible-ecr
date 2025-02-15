@@ -1,0 +1,27 @@
+---
+- name: Test AWS Connection
+  hosts: localhost
+  gather_facts: false
+  collections:
+    - amazon.aws
+  
+  vars:
+    port_range_start: 9000
+    port_range_end: 9999
+    
+  tasks:
+    - name: Generate port number
+      set_fact:
+        port_number: "{{ range(port_range_start, port_range_end + 1) | random }}"
+
+    - name: Display port
+      debug:
+        msg: "Generated port number: {{ port_number }}"
+
+    - name: Get AWS account info
+      aws_caller_info:
+      register: aws_caller_info
+
+    - name: Display AWS info
+      debug:
+        var: aws_caller_info

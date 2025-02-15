@@ -1,0 +1,136 @@
+# Use PHP 8.3 with Apache (do not hardcode --platform here; specify it at build time)
+FROM --platform=linux/amd64 php:8.3-apache
+
+# Set non-interactive mode for apt and lower optimization flags for pdo_sqlsrv
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CFLAGS="-O1 -fno-tree-vectorize" \
+    CXXFLAGS="-O1 -fno-tree-vectorize"
+
+# Set the working directory
+WORKDIR /var/www/html
+
+# Install required system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    unzip \
+    curl \
+    apt-transport-https \
+    ca-certificates \
+    gnupg2 \
+    libpng-dev \
+    libzip-dev \
+    libonig-dev \
+    libicu-dev \
+    libjpeg62-turbo-dev \
+    libfreetype6-dev \
+    libwebp-dev \
+    libxpm-dev \
+    zlib1g-dev \
+    
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add Microsoft repository keys and configuration
+RUN curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/microsoft-archive-keyring.gpg \
+    && echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-archive-keyring.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/microsoft-prod.list \
+    && apt-get update
+
+# Install ODBC drivers and tools
+RUN apt-get update \
+    && apt-get install -y unixodbc unixodbc-dev \
+    && ACCEPT_EULA=Y apt-get install -y msodbcsql17 mssql-tools
+
+# Install SQL Server PHP extensions
+RUN pecl install sqlsrv pdo_sqlsrv \
+    && docker-php-ext-enable sqlsrv pdo_sqlsrv
+
+# Install PHP extensions (excluding GD)
+RUN docker-php-ext-install pdo zip exif pcntl bcmath
+
+# Install GD extension and its dependencies
+RUN apt-get update && apt-get install -y \
+        libfreetype6-dev \
+        libjpeg62-turbo-dev \
+        libpng-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    && docker-php-source extract \
+    && cd /usr/src/php/ext/gd \
+    && phpize \
+    && ./configure --with-freetype --with-jpeg \
+    && make -j$(nproc) \
+    && make install \
+    && docker-php-ext-enable gd \
+    && docker-php-source delete
+
+# Enable Apache mod_rewrite for Laravel
+RUN a2enmod rewrite
+
+# Install Composer
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer \
+    && composer clear-cache
+
+# Create new Laravel project
+RUN composer create-project --prefer-dist laravel/laravel /var/www/html \
+    && composer clear-cache
+
+# Alternative: Copy existing Laravel files
+# COPY . /var/www/html
+# RUN composer install --no-dev --prefer-dist --no-scripts --no-progress
+
+# Add Apache configuration for server-status
+RUN echo '<Location /server-status>\n\
+    SetHandler server-status\n\
+    Require all granted\n\
+</Location>' >> /etc/apache2/sites-available/000-default.conf
+
+# Update Apache configuration for Laravel
+RUN echo '<VirtualHost *:80>\n\
+    DocumentRoot /var/www/html/public\n\
+    <Directory /var/www/html/public>\n\
+        AllowOverride All\n\
+        Require all granted\n\
+        Options -Indexes +FollowSymLinks\n\
+    </Directory>\n\
+    <Location /server-status>\n\
+        SetHandler server-status\n\
+        Require all granted\n\
+    </Location>\n\
+</VirtualHost>' > /etc/apache2/sites-available/000-default.conf
+
+# Prepare the Laravel environment file and set static APP_KEY
+RUN cp /var/www/html/.env.example /var/www/html/.env && \
+    sed -i 's/APP_ENV=local/APP_ENV=production/' /var/www/html/.env && \
+    sed -i 's/APP_DEBUG=true/APP_DEBUG=false/' /var/www/html/.env && \
+    sed -i 's|APP_URL=http://localhost|APP_URL=http://localhost|' /var/www/html/.env && \
+    sed -i 's/DB_CONNECTION=mysql/DB_CONNECTION=sqlsrv/' /var/www/html/.env && \
+    sed -i 's/DB_HOST=127.0.0.1/DB_HOST=localhost/' /var/www/html/.env && \
+    sed -i 's/DB_PORT=3306/DB_PORT=1433/' /var/www/html/.env && \
+    sed -i 's/DB_DATABASE=laravel/DB_DATABASE=master/' /var/www/html/.env && \
+    sed -i "s/DB_USERNAME=root/DB_USERNAME=sa/" /var/www/html/.env && \
+    sed -i "s/DB_PASSWORD=/DB_PASSWORD=${SA_PASSWORD:-YourStrong!Passw0rd}/" /var/www/html/.env && \
+    sed -i 's/^APP_KEY=.*/APP_KEY=base64:hJJHnYHIW3iafXayDVuqm3eddvqmwG9cJnFzQOURMe8=/' /var/www/html/.env && \
+    php artisan config:cache
+
+# Set proper permissions
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 775 /var/www/html/storage \
+    && chmod -R 775 /var/www/html/bootstrap/cache
+
+# Set correct permissions
+RUN chown -R www-data:www-data /var/www/html \
+    && chmod -R 755 /var/www/html/storage
+
+# Setup SSH: create SSH directory and copy authorized_keys
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+COPY .ssh/authorized_keys /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+
+# Copy connection test script
+COPY db-connection-test.sh /db-connection-test.sh
+RUN chmod +x /db-connection-test.sh
+# Expose SSH and HTTP ports
+EXPOSE 22 80
+
+# Start SSH and Apache
+CMD ["/bin/bash", "-c", "service ssh start && apache2-foreground"]
