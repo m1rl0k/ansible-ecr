@@ -1,6 +1,6 @@
 # Ephemeral ECS Environments
 
-This solution creates ephemeral environments in ECS using a shared ALB with dynamic port allocation. Each environment consists of a Laravel application and MSSQL database.
+This solution creates ephemeral environments in ECS using one pre-created domain, a shared ALB and ACM certificate, and a unique external port per environment. Each environment consists of a Laravel application and MSSQL database.
 
 ## Directory Structure
 
@@ -116,6 +116,7 @@ aws ecs create-cluster \
 You'll need:
 - A VPC with at least 2 public subnets
 - An Application Load Balancer (ALB)
+- One pre-created DNS record (`BASE_DOMAIN`) pointing to the ALB, and an ACM certificate covering that hostname
 - Security group allowing inbound traffic on:
   - Port 443 (HTTPS)
   - Ports 9000-9999 (for ephemeral environments)
@@ -143,9 +144,16 @@ Copy the example .env file and update with your values:
 ```bash
 cp .env.example .env
 # Edit .env with your values
-# Source the environment variables
+# Export values so Ansible's runtime lookups can read them
+set -a
 source .env
+set +a
+./scripts/update_ansible_vars.sh
 ```
+
+The generated YAML keeps AWS credentials, `MSSQL_SA_PASSWORD`, and `APP_KEY` as runtime environment lookups; it does not copy their values into Git. AWS CLI/SDK commands also support profiles, SSO and IAM roles. Supply a new database password and a Laravel `APP_KEY` (generate one with `printf 'base64:%s\n' "$(openssl rand -base64 32)"`). Do not pass runtime credentials at build time; ECS supplies them when containers start.
+
+Before building, supply a replacement public key at `docker/.ssh/authorized_keys`, or a replacement private key at `explore-api-uat.pem` from which the scripts can derive the public key. These files and `.env` are ignored by Git. Rotate credentials and replace keys exposed in the old history; never restore those values from an old clone. The local public key is retained after a build.
 
 ## Usage
 
@@ -168,30 +176,64 @@ ansible-playbook ansible/playbooks/create_ephemeral_port.yml
 ansible-playbook ansible/playbooks/cleanup_ephemeral_port.yml
 ```
 
+To tear down one environment immediately, regardless of its expiry date:
+```bash
+ansible-playbook ansible/playbooks/cleanup_ephemeral_port.yml -e environment_id=20261104120000
+```
+
+### GitHub Actions and Cypress
+
+Once your runner has Ansible/AWS dependencies, test dependencies, AWS credentials (prefer OIDC), and the configuration/secrets above, creation publishes `environment_id` and `base_url` to `GITHUB_OUTPUT`. IDs are fresh 14-digit strings, not timestamps, so concurrent jobs do not share a second-based name. The ID is published before creating resources so a failed create can still be cleaned up. Use the returned URL, including its port, as `CYPRESS_BASE_URL`:
+
+```yaml
+- name: Create test environment
+  id: environment
+  working-directory: my-infra
+  run: ansible-playbook ansible/playbooks/create_ephemeral_port.yml
+
+- name: Wait for application and run Cypress
+  env:
+    CYPRESS_BASE_URL: ${{ steps.environment.outputs.base_url }}
+  run: |
+    curl --fail --retry 30 --retry-all-errors --retry-delay 5 "$CYPRESS_BASE_URL"
+    npx cypress run
+
+- name: Remove test environment
+  if: ${{ always() && steps.environment.outputs.environment_id != '' }}
+  working-directory: my-infra
+  env:
+    ENVIRONMENT_ID: ${{ steps.environment.outputs.environment_id }}
+  run: ansible-playbook ansible/playbooks/cleanup_ephemeral_port.yml -e "environment_id=$ENVIRONMENT_ID"
+```
+
 ## How It Works
 
 1. When creating an environment:
    - Randomly selects an unused port (9000-9999)
    - Creates an HTTPS listener on the ALB for that port
    - Deploys an ECS service with Laravel and MSSQL containers
-   - Creates a Route53 record `ephemeral-<uniqueid>.example.com`
+   - Reuses the existing DNS record and certificate; no per-environment Route53 changes are made
 
 2. The environment will be accessible at:
    ```
-   https://ephemeral-<uniqueid>.example.com:<port>/
+   https://example.com:<port>/
    ```
 
 3. The Laravel container can communicate with MSSQL via `localhost:1433`
 
-4. All resources are tagged with:
-   - `Environment=ephemeral`
-   - `ExpireOn=YYYY-MM-DD`
+   The example database is `cypress_test`; `docker/schema.sql` contains only dummy Cypress smoke-test data. Supply `DB_PASSWORD` to Laravel and `SA_PASSWORD` to SQL Server at runtime (the ECS playbook maps both from `MSSQL_SA_PASSWORD`).
 
-5. The cleanup playbook removes expired resources automatically
+4. Environment-owned services, target groups, task definitions and log groups are tagged with:
+   - `Environment=ephemeral`
+   - `Cluster=<ecs_cluster_name>`
+   - `ExpireOn=YYYY-MM-DD`
+   - `CreatedBy=ansible`
+
+5. When invoked, cleanup removes expired environments (or the requested environment ID): services/tasks, autoscaling configuration, per-environment listeners/target groups/logs, and task-definition revisions. The shared DNS record, ALB, certificate and ECS cluster remain. Schedule the default cleanup command separately if you need a periodic janitor.
 
 ## Notes
 
-- Each environment gets its own port and DNS record
+- Each environment gets its own port on the same hostname
 - Environments expire after a configurable number of days
 - The MSSQL container uses SQL Server Express edition
 - Both containers run in the same ECS task for easy communication

@@ -1,0 +1,80 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    creation: "{{ lookup('file', playbook_dir + '/../my-infra/ansible/playbooks/create_ephemeral_port.yml') | from_yaml | first }}"
+    decisions: "{{ (creation.tasks | selectattr('block', 'defined') | first).block | rejectattr('register', 'defined') | list }}"
+    id_task: "{{ creation.pre_tasks | selectattr('set_fact', 'defined') | selectattr('set_fact.unique_id', 'defined') | first }}"
+    port_range_start: 9000
+    port_range_end: 9002
+    generated_ids: []
+  tasks:
+    - name: Load the production port decisions without the AWS inventory query
+      copy:
+        content: "{{ decisions | to_nice_yaml }}"
+        dest: "{{ fixture_dir }}/port-decisions.yml"
+
+    # Given two occupied ports; when production selection runs; then only 9002 remains.
+    - set_fact:
+        alb_info:
+          load_balancers:
+            - listeners:
+                - port: 9000
+                - port: 9001
+    - include_tasks: "{{ fixture_dir }}/port-decisions.yml"
+    - assert:
+        that:
+          - available_ports == [9002]
+          - candidate_port | int == 9002
+
+    # Given all ports occupied; when selection runs; then its guard fails before random choice.
+    - set_fact:
+        candidate_port: untouched
+        alb_info:
+          load_balancers:
+            - listeners:
+                - port: 9000
+                - port: 9001
+                - port: 9002
+    - block:
+        - include_tasks: "{{ fixture_dir }}/port-decisions.yml"
+        - fail:
+            msg: Exhausted ports were accepted
+      rescue:
+        - assert:
+            that:
+              - ansible_failed_task.action == 'assert'
+              - available_ports == []
+              - candidate_port == 'untouched'
+
+    # Given repeated invocations; when the production ID task runs; then IDs stay distinct and 14 digits.
+    - copy:
+        content: |
+          {{ [id_task] | to_nice_yaml }}
+          - set_fact:
+              generated_ids: "{% raw %}{{ generated_ids + [unique_id] }}{% endraw %}"
+        dest: "{{ fixture_dir }}/generate-id.yml"
+    - include_tasks: "{{ fixture_dir }}/generate-id.yml"
+      loop: "{{ range(0, 20) | list }}"
+    - assert:
+        that:
+          - generated_ids | unique | list | length == 20
+          - generated_ids | map('string') | select('match', '^[0-9]{14}$') | list | length == 20
+
+    # Given a leading-zero lookup result; when published; then all 14 digits reach GITHUB_OUTPUT.
+    - set_fact:
+        unique_id: "{{ lookup('ansible.builtin.password', '/dev/null', length=14, chars=['0']) }}"
+    - assert:
+        that:
+          - unique_id == '00000000000000'
+    - copy:
+        content: |
+          {% for task in creation.pre_tasks if 'ansible.builtin.lineinfile' in task %}
+          {{ [task] | to_nice_yaml }}
+          {% endfor %}
+        dest: "{{ fixture_dir }}/publish-id.yml"
+    - include_tasks: "{{ fixture_dir }}/publish-id.yml"
+    - assert:
+        that:
+          - "'environment_id=00000000000000' in lookup('file', fixture_dir + '/github-output').splitlines()"

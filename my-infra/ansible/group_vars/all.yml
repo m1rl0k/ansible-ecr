@@ -1,8 +1,8 @@
 aws_region: "us-east-1"
-aws_access_key_id: ""
-aws_secret_access_key: ""
-ecs_cluster_name: ""
-base_domain: ""
+aws_access_key_id: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
+aws_secret_access_key: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
+ecs_cluster_name: "{{ lookup('env', 'ECS_CLUSTER_NAME') }}"
+base_domain: "{{ lookup('env', 'BASE_DOMAIN') }}"
 
 
 alb_name: "explore-alb"
@@ -17,8 +17,8 @@ vpc_subnets:
 laravel_image: "535002867043.dkr.ecr.us-east-1.amazonaws.com/my-laravel:latest"
 mssql_image: "535002867043.dkr.ecr.us-east-1.amazonaws.com/my-mssql:latest"
 
-# Hardcoded SA password (not recommended for production)
-sa_password: "REDACTED"
+sa_password: "{{ lookup('env', 'MSSQL_SA_PASSWORD') }}"
+app_key: "{{ lookup('env', 'APP_KEY') }}"
 security_group_id: "sg-0229ce0be6b4a55ba"
 # Pre-existing ALB
 

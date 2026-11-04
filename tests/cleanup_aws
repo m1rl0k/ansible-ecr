@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="${AWS_FAKE_LOG:?AWS_FAKE_LOG is required}"
+scenario="${AWS_FAKE_SCENARIO:-default}"
+cluster="fixture-cluster"
+vpc="vpc-fixture"
+expired="11111111111111"
+future="22222222222222"
+unowned="33333333333333"
+orphan="44444444444444"
+unknown_cluster="55555555555555"
+log_only="66666666666666"
+
+printf 'CALL %s\n' "$*" >> "$log"
+
+ecs_service_arn() { printf 'arn:aws:ecs:us-east-1:123456789012:service/%s/ephemeral-%s' "$cluster" "$1"; }
+taskdef_arn() { printf 'arn:aws:ecs:us-east-1:123456789012:task-definition/ephemeral-%s:%s' "$1" "$2"; }
+tg_arn() { printf 'arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/tg-port%s-%s/hash%s' "$2" "$1" "$2"; }
+
+service_json() {
+    local id="$1" env="$2" expire="$3"
+    printf '{"serviceArn":"%s","serviceName":"ephemeral-%s","tags":[{"key":"Environment","value":"%s"},{"key":"ExpireOn","value":"%s"}]}' "$(ecs_service_arn "$id")" "$id" "$env" "$expire"
+}
+
+taskdef_json() {
+    local id="$1" rev="$2" env="$3" expire="$4" owner_cluster="${5:-}"
+    printf '{"taskDefinition":{"taskDefinitionArn":"%s","family":"ephemeral-%s"},"tags":[{"key":"Environment","value":"%s"},{"key":"ExpireOn","value":"%s"}' "$(taskdef_arn "$id" "$rev")" "$id" "$env" "$expire"
+    [[ -n "$owner_cluster" ]] && printf ',{"key":"Cluster","value":"%s"}' "$owner_cluster"
+    printf ']}'
+}
+
+tg_json() {
+    local id="$1" port="$2"
+    printf '{"TargetGroupName":"tg-port%s-%s","TargetGroupArn":"%s","VpcId":"%s"}' "$port" "$id" "$(tg_arn "$id" "$port")" "$vpc"
+}
+
+mutate() {
+    printf 'MUTATE %s\n' "$*" >> "$log"
+}
+
+arg_after() {
+    local want="$1" next=0
+    shift
+    for arg in "$@"; do
+        if [[ "$next" -eq 1 ]]; then
+            printf '%s' "$arg"
+            return
+        fi
+        [[ "$arg" == "$want" ]] && next=1
+    done
+}
+
+service_ids() {
+    case "$scenario" in
+        empty) ;;
+        retained) printf '%s\n' "$future" ;;
+        *) printf '%s\n%s\n%s\n' "$expired" "$future" "$unowned" ;;
+    esac
+}
+
+if [[ "$1 $2" == "ecs list-services" ]]; then
+    printf '{"serviceArns":['
+    first=1
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        [[ "$first" -eq 1 ]] || printf ','
+        printf '"%s"' "$(ecs_service_arn "$id")"
+        first=0
+    done < <(service_ids)
+    printf ']}'
+elif [[ "$1 $2" == "ecs describe-services" ]]; then
+    id="$(arg_after --services "$@")"
+    id="${id##*ephemeral-}"
+    case "$id" in
+        "$expired") body="$(service_json "$id" ephemeral 2020-01-01)" ;;
+        "$future") body="$(service_json "$id" ephemeral 2999-01-01)" ;;
+        "$unowned") body="$(service_json "$id" other 2020-01-01)" ;;
+        *) body="" ;;
+    esac
+    printf '{"services":[%s]}' "$body"
+elif [[ "$1 $2" == "ecs list-task-definitions" ]]; then
+    status="${*: -1}"
+    prefix="$(arg_after --family-prefix "$@")"
+    printf '{"taskDefinitionArns":['
+    if [[ "$scenario" != empty ]]; then
+        case "$status:$prefix:$scenario" in
+            ACTIVE:ephemeral-:retained) printf '"%s","%s","%s"' "$(taskdef_arn "$future" 1)" "$(taskdef_arn "$orphan" 1)" "$(taskdef_arn "$unknown_cluster" 1)" ;;
+            ACTIVE:ephemeral-:*) printf '"%s","%s","%s","%s","%s"' "$(taskdef_arn "$expired" 1)" "$(taskdef_arn "$future" 1)" "$(taskdef_arn "$unowned" 1)" "$(taskdef_arn "$orphan" 1)" "$(taskdef_arn "$unknown_cluster" 1)" ;;
+            INACTIVE:ephemeral-"$expired":*) printf '"%s"' "$(taskdef_arn "$expired" 0)" ;;
+            INACTIVE:ephemeral-"$future":*) printf '"%s"' "$(taskdef_arn "$future" 0)" ;;
+            INACTIVE:ephemeral-"$orphan":*) printf '"%s"' "$(taskdef_arn "$orphan" 0)" ;;
+        esac
+    fi
+    printf ']}'
+elif [[ "$1 $2" == "ecs describe-task-definition" ]]; then
+    arn="$(arg_after --task-definition "$@")"
+    family_rev="${arn##*/ephemeral-}"
+    id="${family_rev%%:*}"
+    case "$id" in
+        "$expired") taskdef_json "$id" 1 ephemeral 2020-01-01 ;;
+        "$future") taskdef_json "$id" 1 ephemeral 2999-01-01 ;;
+        "$unowned") taskdef_json "$id" 1 other 2020-01-01 ;;
+        "$orphan") taskdef_json "$id" 1 ephemeral 2020-01-01 "$cluster" ;;
+        "$unknown_cluster") taskdef_json "$id" 1 ephemeral 2020-01-01 other-cluster ;;
+    esac
+elif [[ "$1 $2" == "elbv2 describe-target-groups" ]]; then
+    printf '{"TargetGroups":['
+    if [[ "$scenario" != empty ]]; then
+        tg_json "$expired" 9001
+        printf ','
+        tg_json "$future" 9002
+        printf ','
+        tg_json "$unowned" 9003
+        printf ','
+        tg_json "$orphan" 9004
+        printf ',{"TargetGroupName":"shared-app","TargetGroupArn":"arn:shared:targetgroup","VpcId":"%s"}' "$vpc"
+    fi
+    printf ']}'
+elif [[ "$1 $2" == "elbv2 describe-tags" ]]; then
+    arn="${*: -1}"
+    id="${arn#*tg-port}"
+    id="${id#*-}"
+    id="${id%%/*}"
+    env=ephemeral
+    expire=2020-01-01
+    [[ "$id" == "$future" ]] && expire=2999-01-01
+    [[ "$id" == "$unowned" ]] && env=other
+    printf '{"TagDescriptions":[{"ResourceArn":"%s","Tags":[{"Key":"Environment","Value":"%s"},{"Key":"ExpireOn","Value":"%s"}]}]}' "$arn" "$env" "$expire"
+elif [[ "$1 $2" == "elbv2 describe-listeners" ]]; then
+    printf '{"Listeners":[{"ListenerArn":"listener-443","Port":443,"DefaultActions":[{"TargetGroupArn":"arn:shared:targetgroup"}]},{"ListenerArn":"listener-expired","Port":9001,"DefaultActions":[{"TargetGroupArn":"%s"}]},{"ListenerArn":"listener-future","Port":9002,"DefaultActions":[{"TargetGroupArn":"%s"}]},{"ListenerArn":"listener-orphan","Port":9004,"DefaultActions":[{"TargetGroupArn":"%s"}]}]}' "$(tg_arn "$expired" 9001)" "$(tg_arn "$future" 9002)" "$(tg_arn "$orphan" 9004)"
+elif [[ "$1 $2" == "logs describe-log-groups" ]]; then
+    if [[ "$scenario" == empty ]]; then
+        printf '{"logGroups":[]}'
+    else
+        printf '{"logGroups":[{"logGroupName":"/ecs/ephemeral/%s","arn":"arn:aws:logs:us-east-1:123456789012:log-group:/ecs/ephemeral/%s"},{"logGroupName":"/ecs/ephemeral/%s","arn":"arn:aws:logs:us-east-1:123456789012:log-group:/ecs/ephemeral/%s"},{"logGroupName":"/ecs/ephemeral/%s","arn":"arn:aws:logs:us-east-1:123456789012:log-group:/ecs/ephemeral/%s"},{"logGroupName":"/ecs/ephemeral/%s","arn":"arn:aws:logs:us-east-1:123456789012:log-group:/ecs/ephemeral/%s"},{"logGroupName":"/ecs/ephemeral/%s","arn":"arn:aws:logs:us-east-1:123456789012:log-group:/ecs/ephemeral/%s"}]}' "$expired" "$expired" "$future" "$future" "$unowned" "$unowned" "$orphan" "$orphan" "$log_only" "$log_only"
+    fi
+elif [[ "$1 $2" == "logs list-tags-for-resource" ]]; then
+    arn="$(arg_after --resource-arn "$@")"
+    id="${arn%:\*}"
+    id="${id##*/}"
+    env=ephemeral
+    expire=2020-01-01
+    owner_cluster="$cluster"
+    [[ "$id" == "$future" ]] && expire=2999-01-01
+    [[ "$id" == "$unowned" ]] && env=other
+    printf '{"tags":{"Environment":"%s","ExpireOn":"%s","Cluster":"%s"}}' "$env" "$expire" "$owner_cluster"
+elif [[ "$1 $2" == "application-autoscaling describe-scalable-targets" ]]; then
+    id="${*: -1}"
+    id="${id##*/ephemeral-}"
+    if [[ "$id" == "$expired" || "$id" == "$future" ]]; then
+        printf '{"ScalableTargets":[{"ResourceId":"service/%s/ephemeral-%s","ScalableDimension":"ecs:service:DesiredCount"}]}' "$cluster" "$id"
+    else
+        printf '{"ScalableTargets":[]}'
+    fi
+elif [[ "$1 $2" == "application-autoscaling deregister-scalable-target" ]]; then
+    mutate "$*"
+    printf '{}'
+elif [[ "$1 $2" == "ecs update-service" || "$1 $2" == "ecs delete-service" || "$1 $2 $3" == "ecs wait services-inactive" || "$1 $2" == "ecs deregister-task-definition" ]]; then
+    mutate "$*"
+    printf '{}'
+elif [[ "$1 $2" == "ecs delete-task-definitions" ]]; then
+    mutate "$*"
+    if [[ "$scenario" == failures_array ]]; then
+        printf '{"failures":[{"arn":"fixture","reason":"DELETE_FAILED"}]}'
+    else
+        printf '{"failures":[]}'
+    fi
+elif [[ "$1 $2" == "elbv2 delete-listener" ]]; then
+    mutate "$*"
+    [[ "$scenario" == listener_error ]] && exit 42
+    printf '{}'
+elif [[ "$1 $2" == "elbv2 delete-target-group" || "$1 $2" == "logs delete-log-group" ]]; then
+    mutate "$*"
+    printf '{}'
+else
+    printf 'unexpected aws call: %s\n' "$*" >&2
+    exit 64
+fi

@@ -34,7 +34,6 @@ RUN chmod +x /init-db.sh
 # Set environment variables for SQL Server
 ENV ACCEPT_EULA=Y
 ENV MSSQL_PID=Express
-ENV SA_PASSWORD="REDACTED"
 ENV MSSQL_TCP_PORT=1433
 ENV MSSQL_MEMORY_LIMIT_MB=4096
 ENV MSSQL_BACKUP_DIR=/var/opt/mssql/backup

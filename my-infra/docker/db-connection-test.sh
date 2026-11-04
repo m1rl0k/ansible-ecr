@@ -1,5 +1,8 @@
 #!/bin/bash
 
+export DB_PASSWORD="${DB_PASSWORD:-${SA_PASSWORD:-${MSSQL_SA_PASSWORD:-}}}"
+: "${DB_PASSWORD:?Set DB_PASSWORD, SA_PASSWORD or MSSQL_SA_PASSWORD at runtime}"
+
 # Database connection test script
 echo "Attempting to connect to SQL Server database..."
 
@@ -10,9 +13,10 @@ ATTEMPT=0
 while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     
         # Fallback PHP connection test
-        php -r '
+        if php -r '
         try {
-            $conn = new PDO("sqlsrv:Server=sqlserver,1433;Database=master", "sa", "REDACTED");
+            $dsn = sprintf("sqlsrv:Server=%s,%s;Database=%s", getenv("DB_HOST") ?: "localhost", getenv("DB_PORT") ?: "1433", getenv("DB_DATABASE") ?: "cypress_test");
+            $conn = new PDO($dsn, "sa", getenv("DB_PASSWORD"));
             $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
             echo "PHP PDO connection successful!\n";
             exit(0);
@@ -20,13 +24,10 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             echo "PDO Connection failed: " . $e->getMessage() . "\n";
             exit(1);
         }
-        '
-        
-        if [ $? -eq 0 ]; then
+        '; then
             echo "Database connection successful!"
             exit 0
         fi
-    fi
     
     echo "Connection attempt $ATTEMPT failed. Retrying in 20 seconds..."
     sleep 20

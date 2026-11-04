@@ -1,0 +1,82 @@
+---
+- name: Find this environment's resources
+  ansible.builtin.set_fact:
+    environment_service: "{{ selected_services | selectattr('serviceName', 'equalto', 'ephemeral-' + cleanup_environment_id) | list }}"
+    environment_targets: "{{ selected_targets | selectattr('TargetGroupName', 'search', '-' + cleanup_environment_id + '$') | list }}"
+    environment_definitions: "{{ selected_definitions | select('search', '/ephemeral-' + cleanup_environment_id + ':[0-9]+$') | list }}"
+
+- name: Describe service autoscaling targets
+  ansible.builtin.command:
+    argv: [aws, application-autoscaling, describe-scalable-targets, --service-namespace, ecs, --resource-ids, "service/{{ ecs_cluster_name }}/ephemeral-{{ cleanup_environment_id }}"]
+  register: scaling_inventory
+  changed_when: false
+  check_mode: false
+
+- name: Remove service autoscaling and its policies
+  ansible.builtin.command:
+    argv: [aws, application-autoscaling, deregister-scalable-target, --service-namespace, ecs, --resource-id, "{{ item.ResourceId }}", --scalable-dimension, "{{ item.ScalableDimension }}"]
+  loop: "{{ (scaling_inventory.stdout | from_json).ScalableTargets }}"
+
+- name: Scale service to zero
+  ansible.builtin.command:
+    argv: [aws, ecs, update-service, --cluster, "{{ ecs_cluster_name }}", --service, "ephemeral-{{ cleanup_environment_id }}", --desired-count, '0']
+  when: environment_service | length > 0
+
+- name: Delete drained service
+  ansible.builtin.command:
+    argv: [aws, ecs, delete-service, --cluster, "{{ ecs_cluster_name }}", --service, "ephemeral-{{ cleanup_environment_id }}"]
+  when: environment_service | length > 0
+
+- name: Wait until the service and its tasks are inactive
+  ansible.builtin.command:
+    argv: [aws, ecs, wait, services-inactive, --cluster, "{{ ecs_cluster_name }}", --services, "ephemeral-{{ cleanup_environment_id }}"]
+  when: environment_service | length > 0
+  changed_when: false
+
+- name: Delete only this environment's dynamic-port listeners
+  ansible.builtin.command:
+    argv: [aws, elbv2, delete-listener, --listener-arn, "{{ item.ListenerArn }}"]
+  loop: "{{ (listener_inventory.stdout | from_json).Listeners }}"
+  when:
+    - item.Port | int >= 9000
+    - item.Port | int <= 9999
+    - item.DefaultActions | length == 1
+    - item.DefaultActions[0].TargetGroupArn | default('') in (environment_targets | map(attribute='TargetGroupArn') | list)
+
+- name: Delete this environment's target groups
+  ansible.builtin.command:
+    argv: [aws, elbv2, delete-target-group, --target-group-arn, "{{ item.TargetGroupArn }}"]
+  loop: "{{ environment_targets }}"
+
+- name: List previously deregistered revisions for this owned family
+  ansible.builtin.command:
+    argv: [aws, ecs, list-task-definitions, --family-prefix, "ephemeral-{{ cleanup_environment_id }}", --status, INACTIVE]
+  register: inactive_inventory
+  changed_when: false
+  check_mode: false
+
+- name: Deregister this environment's task definition revisions
+  ansible.builtin.command:
+    argv: [aws, ecs, deregister-task-definition, --task-definition, "{{ item }}"]
+  loop: "{{ environment_definitions }}"
+  no_log: true
+
+- name: Delete deregistered task definition revisions
+  ansible.builtin.command:
+    argv: [aws, ecs, delete-task-definitions, --task-definitions, "{{ item }}"]
+  loop: "{{ (environment_definitions + (inactive_inventory.stdout | from_json).taskDefinitionArns | select('search', '/ephemeral-' + cleanup_environment_id + ':[0-9]+$') | list) | unique | list }}"
+  register: definition_deletions
+  no_log: true
+
+- name: Require task definition deletions to succeed
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | from_json).failures | default([]) | length == 0
+    fail_msg: "AWS reported a task definition deletion failure."
+  loop: "{{ definition_deletions.results | default([]) | rejectattr('skipped', 'defined') | list }}"
+  no_log: true
+
+- name: Delete this stopped environment's log group
+  ansible.builtin.command:
+    argv: [aws, logs, delete-log-group, --log-group-name, "{{ item.logGroupName }}"]
+  loop: "{{ (log_inventory.stdout | from_json).logGroups | selectattr('logGroupName', 'equalto', '/ecs/ephemeral/' + cleanup_environment_id) | list }}"

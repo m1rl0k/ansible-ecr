@@ -1,147 +1,180 @@
 ---
-- name: Cleanup ephemeral environment resources
+- name: Cleanup expired or explicitly selected ephemeral environments
   hosts: localhost
   connection: local
   gather_facts: false
   vars_files:
     - "{{ playbook_dir }}/../group_vars/all.yml"
   environment:
-    AWS_ACCESS_KEY_ID: "{{ aws_access_key_id }}"
-    AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key }}"
     AWS_DEFAULT_REGION: "{{ aws_region }}"
     AWS_REGION: "{{ aws_region }}"
+    AWS_DEFAULT_OUTPUT: json
+    AWS_PAGER: ""
+  vars:
+    today: "{{ lookup('pipe', 'date -u +%Y-%m-%d') }}"
+    requested_environment_id: "{{ environment_id | default('') | string }}"
+    selected_services: []
+    selected_definitions: []
+    selected_targets: []
+    selected_logs: []
 
   tasks:
-    ##################################################################
-    # 1) Identify and Clean Target Groups
-    ##################################################################
-    - name: Fetch all Target Groups
-      shell: >
-        aws elbv2 describe-target-groups 
-        --region "{{ aws_region }}"
-        --output json
-      register: target_groups_raw
+    - name: Validate cleanup scope
+      ansible.builtin.assert:
+        that:
+          - aws_region | length > 0
+          - ecs_cluster_name | length > 0
+          - alb_arn | length > 0
+          - vpc_id | length > 0
+          - environment_tag | length > 0
+          - requested_environment_id == '' or requested_environment_id is match('^[0-9]{14}$')
+
+    - name: List ECS services
+      ansible.builtin.command:
+        argv: [aws, ecs, list-services, --cluster, "{{ ecs_cluster_name }}"]
+      register: service_inventory
       changed_when: false
+      check_mode: false
 
-    - name: Filter Ephemeral Target Groups
-      set_fact:
-        target_groups_to_delete: >-
-          {{ 
-            (target_groups_raw.stdout | from_json).TargetGroups | default([]) | 
-            selectattr('TargetGroupName', 'match', '^tg-port[0-9]+-[0-9]{14}$') |
-            selectattr('LoadBalancerArns', 'contains', alb_arn) |
-            map(attribute='TargetGroupArn') | list
-          }}
+    - name: Describe ephemeral services and ownership tags
+      ansible.builtin.command:
+        argv: [aws, ecs, describe-services, --cluster, "{{ ecs_cluster_name }}", --services, "{{ item }}", --include, TAGS]
+      loop: "{{ (service_inventory.stdout | from_json).serviceArns | select('search', '/ephemeral-[0-9]{14}$') | list }}"
+      register: service_details
+      changed_when: false
+      check_mode: false
+      no_log: true
 
-    ##################################################################
-    # 2) Identify and Clean ECS Services
-    ##################################################################
-    - name: Get Services from ECS Cluster
-      shell: >
-        aws ecs list-services
-        --cluster "{{ ecs_cluster_name }}"
-        --region "{{ aws_region }}"
-        --output json
-      register: ecs_services
+    - name: Select owned services requested by CI or expired
+      ansible.builtin.set_fact:
+        selected_services: "{{ selected_services + [item] }}"
+      vars:
+        resource_tags: "{{ item.tags | default([]) | items2dict(key_name='key', value_name='value') }}"
+      loop: "{{ service_details.results | default([]) | map(attribute='stdout') | map('from_json') | map(attribute='services') | flatten }}"
+      when:
+        - resource_tags.Environment | default('') == environment_tag
+        - >-
+          (requested_environment_id != '' and item.serviceName == 'ephemeral-' + requested_environment_id)
+          or (requested_environment_id == '' and resource_tags.ExpireOn | default('') is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          and resource_tags.ExpireOn | default('9999-12-31') <= today)
+      no_log: true
 
-    - name: Filter Ephemeral Services
-      set_fact:
-        services_to_delete: >-
-          {{ 
-            (ecs_services.stdout | from_json).serviceArns | default([]) | 
-            select('match', '.*ephemeral-[0-9]{14}$') | list
-          }}
+    - name: List active ephemeral task definition revisions
+      ansible.builtin.command:
+        argv: [aws, ecs, list-task-definitions, --family-prefix, ephemeral-, --status, ACTIVE]
+      register: definition_inventory
+      changed_when: false
+      check_mode: false
 
-    ##################################################################
-    # 3) Identify and Clean ALB Listeners
-    ##################################################################
-    - name: Get listeners for ALB
-      shell: >
-        aws elbv2 describe-listeners
-        --load-balancer-arn "{{ alb_arn }}"
-        --region "{{ aws_region }}"
-        --output json
-      register: listeners_raw
+    - name: Describe task definition ownership tags
+      ansible.builtin.command:
+        argv: [aws, ecs, describe-task-definition, --task-definition, "{{ item }}", --include, TAGS]
+      loop: "{{ (definition_inventory.stdout | from_json).taskDefinitionArns }}"
+      register: definition_details
+      changed_when: false
+      check_mode: false
+      no_log: true
 
-    - name: Find listeners to delete
-      set_fact:
-        listeners_to_delete: >-
-          {{ 
-            listeners_raw.stdout | from_json | json_query('Listeners[?contains(DefaultActions[0].TargetGroupArn, `tg-port`)]') |
-            map(attribute='ListenerArn') | list
-          }}
+    - name: Identify services which must be retained
+      ansible.builtin.set_fact:
+        retained_service_families: "{{ service_details.results | default([]) | map(attribute='stdout') | map('from_json') | map(attribute='services') | flatten | rejectattr('serviceArn', 'in', selected_services | map(attribute='serviceArn') | list) | map(attribute='serviceName') | list }}"
 
-    ##################################################################
-    # 4) Identify and Clean CloudWatch Log Groups
-    ##################################################################
-    - name: Get CloudWatch Log Groups
-      shell: >
-        aws logs describe-log-groups
-        --log-group-name-prefix "/ecs/ephemeral/"
-        --region "{{ aws_region }}"
-        --output json
-      register: log_groups_raw
+    - name: Select owned task definitions requested by CI or expired
+      ansible.builtin.set_fact:
+        selected_definitions: "{{ selected_definitions + [item.taskDefinition.taskDefinitionArn] }}"
+      vars:
+        resource_tags: "{{ item.tags | default([]) | items2dict(key_name='key', value_name='value') }}"
+      loop: "{{ definition_details.results | default([]) | map(attribute='stdout') | map('from_json') | list }}"
+      when:
+        - item.taskDefinition.family is match('^ephemeral-[0-9]{14}$')
+        - item.taskDefinition.family not in retained_service_families
+        - resource_tags.Environment | default('') == environment_tag
+        - resource_tags.Cluster | default('') == ecs_cluster_name or item.taskDefinition.family in (selected_services | map(attribute='serviceName') | list)
+        - >-
+          (requested_environment_id != '' and item.taskDefinition.family == 'ephemeral-' + requested_environment_id)
+          or (requested_environment_id == '' and resource_tags.ExpireOn | default('') is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          and resource_tags.ExpireOn | default('9999-12-31') <= today)
+      no_log: true
 
-    - name: Filter Ephemeral Log Groups
-      set_fact:
-        log_groups_to_delete: >-
-          {{ 
-            (log_groups_raw.stdout | from_json).logGroups | default([]) |
-            map(attribute='logGroupName') | list
-          }}
+    - name: List target groups
+      ansible.builtin.command:
+        argv: [aws, elbv2, describe-target-groups]
+      register: target_inventory
+      changed_when: false
+      check_mode: false
 
-    ##################################################################
-    # 5) Cleanup Actions
-    ##################################################################
-    - name: Delete ECS Services
-      shell: >
-        aws ecs delete-service
-        --cluster "{{ ecs_cluster_name }}"
-        --service "{{ item | basename }}"
-        --force
-        --region "{{ aws_region }}"
-      loop: "{{ services_to_delete }}"
-      ignore_errors: true
-      when: services_to_delete | length > 0
+    - name: Describe ephemeral target group ownership tags
+      ansible.builtin.command:
+        argv: [aws, elbv2, describe-tags, --resource-arns, "{{ item.TargetGroupArn }}"]
+      loop: "{{ (target_inventory.stdout | from_json).TargetGroups | selectattr('TargetGroupName', 'match', '^tg-port[0-9]+-[0-9]{14}$') | selectattr('VpcId', 'equalto', vpc_id) | list }}"
+      register: target_details
+      changed_when: false
+      check_mode: false
 
-    - name: Delete Listeners
-      shell: >
-        aws elbv2 delete-listener
-        --listener-arn "{{ item }}"
-        --region "{{ aws_region }}"
-      loop: "{{ listeners_to_delete }}"
-      ignore_errors: true
-      when: listeners_to_delete | length > 0
+    - name: Select owned target groups requested by CI or expired
+      ansible.builtin.set_fact:
+        selected_targets: "{{ selected_targets + [item.item] }}"
+      vars:
+        resource_tags: "{{ (item.stdout | from_json).TagDescriptions[0].Tags | items2dict(key_name='Key', value_name='Value') }}"
+        family: "ephemeral-{{ item.item.TargetGroupName.split('-')[-1] }}"
+      loop: "{{ target_details.results | default([]) }}"
+      when:
+        - family not in retained_service_families
+        - item.item.LoadBalancerArns | default([]) | difference([alb_arn]) | length == 0
+        - resource_tags.Environment | default('') == environment_tag
+        - >-
+          (requested_environment_id != '' and family == 'ephemeral-' + requested_environment_id)
+          or (requested_environment_id == '' and resource_tags.ExpireOn | default('') is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          and resource_tags.ExpireOn | default('9999-12-31') <= today)
 
-    - name: Delete Target Groups
-      shell: >
-        aws elbv2 delete-target-group
-        --target-group-arn "{{ item }}"
-        --region "{{ aws_region }}"
-      loop: "{{ target_groups_to_delete }}"
-      ignore_errors: true
-      when: target_groups_to_delete | length > 0
+    - name: List shared ALB listeners
+      ansible.builtin.command:
+        argv: [aws, elbv2, describe-listeners, --load-balancer-arn, "{{ alb_arn }}"]
+      register: listener_inventory
+      changed_when: false
+      check_mode: false
 
-    - name: Delete CloudWatch Log Groups
-      shell: >
-        aws logs delete-log-group
-        --log-group-name "{{ item }}"
-        --region "{{ aws_region }}"
-      loop: "{{ log_groups_to_delete }}"
-      ignore_errors: true
-      when: log_groups_to_delete | length > 0
+    - name: List ephemeral log groups
+      ansible.builtin.command:
+        argv: [aws, logs, describe-log-groups, --log-group-name-prefix, /ecs/ephemeral/]
+      register: log_inventory
+      changed_when: false
+      check_mode: false
 
-    ##################################################################
-    # 6) Summary
-    ##################################################################
-    - name: Display Cleanup Summary
-      debug:
-        msg:
-          - "Cleanup Summary:"
-          - "Environment: {{ environment_tag }}"
-          - "Cluster: {{ ecs_cluster_name }}"
-          - "Load Balancer: {{ alb_name }}"
-          - "ECS Services found for deletion: {{ services_to_delete | length }}"
-          - "Target Groups found for deletion: {{ target_groups_to_delete | length }}"
-          - "Listeners found for deletion: {{ listeners_to_delete | length }}"
-          - "CloudWatch Log Groups found for deletion: {{ log_groups_to_delete | length }}"
+    - name: Collect owned environment IDs to remove
+      ansible.builtin.command:
+        argv: [aws, logs, list-tags-for-resource, --resource-arn, "{{ item.logGroupArn | default(item.arn | regex_replace(':\\*$', '')) }}"]
+      loop: "{{ (log_inventory.stdout | from_json).logGroups | selectattr('logGroupName', 'match', '^/ecs/ephemeral/[0-9]{14}$') | list }}"
+      register: log_details
+      changed_when: false
+      check_mode: false
+
+    - name: Select owned orphan logs requested by CI or expired
+      ansible.builtin.set_fact:
+        selected_logs: "{{ selected_logs + [item.item.logGroupName] }}"
+      vars:
+        resource_tags: "{{ (item.stdout | from_json).tags | default({}) }}"
+        family: "ephemeral-{{ item.item.logGroupName.split('/')[-1] }}"
+      loop: "{{ log_details.results | default([]) }}"
+      when:
+        - family not in retained_service_families
+        - resource_tags.Environment | default('') == environment_tag
+        - resource_tags.Cluster | default('') == ecs_cluster_name
+        - >-
+          (requested_environment_id != '' and family == 'ephemeral-' + requested_environment_id)
+          or (requested_environment_id == '' and resource_tags.ExpireOn | default('') is match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          and resource_tags.ExpireOn | default('9999-12-31') <= today)
+
+    - name: Collect owned environment IDs to remove
+      ansible.builtin.set_fact:
+        selected_environment_ids: "{{ (selected_services | map(attribute='serviceName') | map('regex_replace', '^ephemeral-', '') | list + selected_definitions | map('regex_replace', '^.*:task-definition/ephemeral-([0-9]{14}):[0-9]+$', '\\1') | list + selected_targets | map(attribute='TargetGroupName') | map('regex_replace', '^tg-port[0-9]+-', '') | list + selected_logs | map('regex_replace', '^/ecs/ephemeral/', '') | list) | unique | list }}"
+
+    - name: Clean each selected environment without touching shared infrastructure
+      ansible.builtin.include_tasks: cleanup_environment.yml
+      loop: "{{ selected_environment_ids }}"
+      loop_control:
+        loop_var: cleanup_environment_id
+
+    - name: Report selected environments
+      ansible.builtin.debug:
+        msg: "Environments selected: {{ selected_environment_ids }}. Shared ALB, certificate, and DNS record retained."

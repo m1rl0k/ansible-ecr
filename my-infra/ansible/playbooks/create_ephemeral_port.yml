@@ -3,10 +3,8 @@
   hosts: localhost
   gather_facts: false
   environment:
-    AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
-    AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
-    AWS_DEFAULT_REGION: "us-east-1"
-    AWS_REGION: "us-east-1"
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+    AWS_REGION: "{{ aws_region }}"
   collections:
     - amazon.aws
     - community.general
@@ -17,22 +15,23 @@
   vars:
     port_range_start: 9000
     port_range_end: 9999
-    max_attempts: 15
-    expire_on: "{{ lookup('pipe', 'date -v+{{ default_expire_days }}d +%Y-%m-%d') }}"
+    expire_on: "{{ '%Y-%m-%d' | strftime((lookup('pipe', 'date -u +%s') | int) + ((default_expire_days | int) * 86400), utc=true) }}"
 
   pre_tasks:
     - name: Set unique ID for the environment
       set_fact:
-        unique_id: "{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
-    - name: Set subdomain name based on unique_id
-      set_fact:
-        subdomain_name: "ephemeral-{{ unique_id }}"
+        unique_id: "{{ lookup('ansible.builtin.password', '/dev/null', length=14, chars=['digits']) }}"
+    - name: Publish environment ID for workflow cleanup
+      ansible.builtin.lineinfile:
+        path: "{{ lookup('env', 'GITHUB_OUTPUT') }}"
+        line: "environment_id={{ unique_id }}"
+        insertafter: EOF
+      when: lookup('env', 'GITHUB_OUTPUT') | length > 0
     - name: Debug AWS configuration
       debug:
         msg:
           - "AWS Region: {{ lookup('env', 'AWS_REGION') | default('NOT SET') }}"
           - "AWS Default Region: {{ lookup('env', 'AWS_DEFAULT_REGION') | default('NOT SET') }}"
-          - "AWS Access Key ID: {{ lookup('env', 'AWS_ACCESS_KEY_ID') | default('NOT SET') }}"
           - "ALB Name: {{ alb_name | default('NOT SET') }}"
           - "ALB ARN: {{ alb_arn | default('NOT SET') }}"
     - name: Validate required variables
@@ -42,7 +41,11 @@
           - vpc_subnets is defined
           - security_group_id is defined
           - ecs_cluster_name is defined
-          - sa_password is defined
+          - ecs_cluster_name | length > 0
+          - base_domain is defined
+          - base_domain | length > 0
+          - sa_password is defined and sa_password | length > 0
+          - app_key is defined and app_key | length > 0
           - laravel_image is defined
           - mssql_image is defined
           - ecs_task_execution_role_arn is defined
@@ -55,9 +58,7 @@
       changed_when: false
       failed_when: exec_role_info.rc != 0
       environment:
-        AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
-        AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
-        AWS_DEFAULT_REGION: "us-east-1"
+        AWS_DEFAULT_REGION: "{{ aws_region }}"
     - name: Validate ECS task role exists (if provided)
       when: ecs_task_role_arn is defined and ecs_task_role_arn | length > 0
       shell: "aws iam get-role --role-name {{ ecs_task_role_arn.split('/')[-1] }}"
@@ -65,62 +66,55 @@
       changed_when: false
       failed_when: task_role_info.rc != 0
       environment:
-        AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
-        AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
-        AWS_DEFAULT_REGION: "us-east-1"
+        AWS_DEFAULT_REGION: "{{ aws_region }}"
 
   tasks:
     ##################################################################
     # 1) Select and validate random port
     ##################################################################
-    - name: Select a random ephemeral port
+    - name: Select a random available ephemeral port
       block:
-        - name: Generate random port
-          set_fact:
-            candidate_port: "{{ range(port_range_start, port_range_end + 1) | random }}"
-          register: port_selection
-          until: port_selection is success
-          retries: "{{ max_attempts }}"
-          delay: 2
-
-        - name: Debug ALB variables
-          debug:
-            msg:
-              - "ALB Name: {{ alb_name | default('NOT SET') }}"
-              - "ALB ARN: {{ alb_arn | default('NOT SET') }}"
-
-        - name: Validate ALB name
-          assert:
-            that:
-              - alb_name is defined
-              - alb_name | length > 0
-            fail_msg: "ALB name is not properly set"
-
-        - name: Check if port is already in use
+        - name: Read existing ALB listeners
           amazon.aws.elb_application_lb_info:
-            region: "us-east-1"
+            region: "{{ aws_region }}"
             load_balancer_arns: ["{{ alb_arn }}"]
+            include_listeners: true
+            include_listener_rules: false
           register: alb_info
           retries: 3
           delay: 5
           until: alb_info is success
 
-        - name: Verify port availability
-          set_fact:
-            port_in_use: "{{ alb_info.listeners | default([]) | selectattr('Port', 'equalto', candidate_port) | list | length > 0 }}"
+        - name: Validate the configured ALB exists
+          assert:
+            that:
+              - alb_info.load_balancers | length == 1
+            fail_msg: "Expected exactly one configured ALB"
 
-        - name: Fail if port is in use
-          fail:
-            msg: "Selected port {{ candidate_port }} is already in use"
-          when: port_in_use | bool
-      rescue:
-        - name: Handle port selection failure
-          fail:
-            msg: "Failed to find an available port after {{ max_attempts }} attempts"
+        - name: Calculate available ports
+          set_fact:
+            available_ports: "{{ range(port_range_start, port_range_end + 1) | difference(alb_info.load_balancers[0].listeners | map(attribute='port') | list) | list }}"
+
+        - name: Require an available port
+          assert:
+            that:
+              - available_ports | length > 0
+            fail_msg: "No free ports remain in the configured ephemeral range"
+
+        - name: Select an available port
+          set_fact:
+            candidate_port: "{{ available_ports | random }}"
 
     - name: Display selected port
       debug:
         msg: "Selected port {{ candidate_port }}"
+
+    - name: Publish base URL for workflow tests
+      ansible.builtin.lineinfile:
+        path: "{{ lookup('env', 'GITHUB_OUTPUT') }}"
+        line: "base_url=https://{{ base_domain }}:{{ candidate_port }}"
+        insertafter: EOF
+      when: lookup('env', 'GITHUB_OUTPUT') | length > 0
 
     ##################################################################
     # 2) Create target group
@@ -143,6 +137,7 @@
         tags:
           Name: "ephemeral-{{ unique_id }}"
           Environment: "{{ environment_tag }}"
+          Cluster: "{{ ecs_cluster_name }}"
           ExpireOn: "{{ expire_on }}"
           CreatedBy: "ansible"
       register: target_group
@@ -154,11 +149,17 @@
       amazon.aws.cloudwatchlogs_log_group:
         log_group_name: "/ecs/ephemeral/{{ unique_id }}"
         state: present
+        tags:
+          Environment: "{{ environment_tag }}"
+          Cluster: "{{ ecs_cluster_name }}"
+          ExpireOn: "{{ expire_on }}"
+          CreatedBy: "ansible"
 
     ##################################################################
     # 4) Create ECS Task Definition
     ##################################################################
     - name: Create task definition
+      no_log: true
       community.aws.ecs_taskdefinition:
         family: "ephemeral-{{ unique_id }}"
         containers:
@@ -172,6 +173,8 @@
             cpu: 2048
             memory: 3072
             environment:
+              - name: APP_KEY
+                value: "{{ app_key }}"
               - name: DB_CONNECTION
                 value: sqlsrv
               - name: DB_HOST
@@ -179,7 +182,7 @@
               - name: DB_PORT
                 value: "1433"
               - name: DB_DATABASE
-                value: master
+                value: cypress_test
               - name: DB_USERNAME
                 value: sa
               - name: DB_PASSWORD
@@ -220,6 +223,21 @@
         task_role_arn: "{{ ecs_task_role_arn | default(omit) }}"
         state: present
       register: task_definition
+
+    - name: Tag ECS task definition
+      command:
+        argv:
+          - aws
+          - ecs
+          - tag-resource
+          - --resource-arn
+          - "{{ task_definition.taskdefinition.taskDefinitionArn }}"
+          - --tags
+          - "key=Name,value=ephemeral-{{ unique_id }}"
+          - "key=Environment,value={{ environment_tag }}"
+          - "key=Cluster,value={{ ecs_cluster_name }}"
+          - "key=ExpireOn,value={{ expire_on }}"
+          - "key=CreatedBy,value=ansible"
 
     ##################################################################
     # 5) Create ALB Listener via AWS CLI
@@ -268,39 +286,27 @@
         tags:
           Name: "ephemeral-{{ unique_id }}"
           Environment: "{{ environment_tag }}"
+          Cluster: "{{ ecs_cluster_name }}"
           ExpireOn: "{{ expire_on }}"
           CreatedBy: "ansible"
         state: present
       register: ecs_service
 
     ##################################################################
-    # 7) Tag ECS Task Definition
+    # 8) Wait for ECS service to become active
     ##################################################################
-    - name: Tag ECS task definition
+    - name: Wait for ECS service to become active
       command:
         argv:
           - aws
           - ecs
-          - tag-resource
-          - --resource-arn
-          - "{{ task_definition.taskdefinition.taskDefinitionArn }}"
-          - --tags
-          - "key=Name,value=ephemeral-{{ unique_id }}"
-          - "key=Environment,value={{ environment_tag }}"
-          - "key=ExpireOn,value={{ expire_on }}"
-          - "key=CreatedBy,value=ansible"
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ lookup('env', 'AWS_ACCESS_KEY_ID') }}"
-        AWS_SECRET_ACCESS_KEY: "{{ lookup('env', 'AWS_SECRET_ACCESS_KEY') }}"
-        AWS_DEFAULT_REGION: "us-east-1"
-      delegate_to: localhost
-
-    ##################################################################
-    # 8) Wait for ECS service to become active
-    ##################################################################
-    - name: Wait for ECS service to become active
-      pause:
-        seconds: 30
+          - wait
+          - services-stable
+          - --cluster
+          - "{{ ecs_cluster_name }}"
+          - --services
+          - "ephemeral-{{ unique_id }}"
+      changed_when: false
 
     ##################################################################
     # 9) Create target tracking scaling policy for ECS Service
@@ -334,7 +340,7 @@
           Task Definition: {{ task_definition.taskdefinition.taskDefinitionArn }}
           Service: {{ ecs_service.service.serviceName }}
           Target Group: {{ target_group.target_group_arn }}
-          Created: {{ lookup('pipe', 'date +%Y-%m-%d_%H:%M:%S') }}
+          Created: {{ now(utc=true, fmt='%Y-%m-%d_%H:%M:%SZ') }}
         dest: "./environment-{{ unique_id }}.txt"
       delegate_to: localhost
 
