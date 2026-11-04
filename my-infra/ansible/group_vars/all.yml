@@ -1,8 +1,8 @@
 aws_region: "us-east-1"
 aws_access_key_id: ""
 aws_secret_access_key: ""
-ecs_cluster_name: "devpathful"
-base_domain: "app-containers.pathful.com"
+ecs_cluster_name: ""
+base_domain: ""
 
 
 alb_name: "explore-alb"
